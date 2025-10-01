@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const Disassembler = dis.Disassembler;
 
 const syscall_insn_size = 2;
+const page_size = 0x10000;
 
 extern "kernel32" fn FlushInstructionCache(
     process: win32.HANDLE,
@@ -16,6 +17,9 @@ extern "kernel32" fn FlushInstructionCache(
 ) callconv(.winapi) win32.BOOL;
 
 pub fn open(gpa: Allocator, file_name: []const u8) !u64 {
+    var allocated_pages: std.ArrayList(u64) = .empty;
+    defer allocated_pages.deinit(gpa);
+
     const elf_file = try std.fs.cwd().openFile(file_name, .{ .mode = .read_only });
     var buffer: [1024]u8 = undefined;
 
@@ -38,12 +42,20 @@ pub fn open(gpa: Allocator, file_name: []const u8) !u64 {
         const pages_begin_addr = (std.math.divCeil(u64, header.p_vaddr, 0x10000) catch unreachable) * 0x10000;
         const pages_size = ((header.p_memsz + 0xFFFF) & ~@as(u64, 0xFFFF));
 
-        _ = try win32.VirtualAlloc(
-            @ptrFromInt(pages_begin_addr),
-            @intCast(pages_size),
-            win32.MEM_RESERVE | win32.MEM_COMMIT,
-            win32.PAGE_EXECUTE_READWRITE,
-        );
+        for (0..pages_size / page_size) |i| {
+            const page = pages_begin_addr + (i * page_size);
+
+            if (std.mem.indexOfScalar(u64, allocated_pages.items, page) == null) {
+                _ = try win32.VirtualAlloc(
+                    @ptrFromInt(page),
+                    page_size,
+                    win32.MEM_RESERVE | win32.MEM_COMMIT,
+                    win32.PAGE_EXECUTE_READWRITE,
+                );
+
+                try allocated_pages.append(gpa, page);
+            }
+        }
 
         try elf_file_reader.seekTo(header.p_offset);
 
@@ -59,7 +71,7 @@ pub fn open(gpa: Allocator, file_name: []const u8) !u64 {
             );
 
             const offset = getLoadEntryContentOffset(&elf_header, &header);
-            breakSyscallInstructions(header.p_vaddr + offset, buf[offset..]);
+            breakSyscallInstructions(header.p_vaddr + offset, buf);
         }
 
         // Some sections may have 0 file size (just reserved memory), and WriteProcessMemory would crash on zero length. Truly a winapi moment.
